@@ -18,11 +18,22 @@
 #include "Kangaroo.h"
 #include "Timer.h"
 #include "SECPK1/SECP256k1.h"
+#include "SECPK1/Int.h"
 #include "GPU/GPUEngine.h"
 #include <fstream>
 #include <string>
 #include <string.h>
 #include <stdexcept>
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 using namespace std;
 
@@ -43,6 +54,8 @@ void printUsage() {
   printf(" -t nbThread: Secify number of thread\n");
   printf(" -w workfile: Specify file to save work into (current processed key only)\n");
   printf(" -i workfile: Specify file to load work from (current processed key only)\n");
+  printf(" --start-dec <start_dec>  --end-dec <end_dec>  --pubkey <hex>\n");
+  printf(" --start-hex <start_hex>  --end-hex <end_hex>  --pubkey <hex>\n");
   printf(" -wi workInterval: Periodic interval (in seconds) for saving work\n");
   printf(" -ws: Save kangaroos in the work file\n");
   printf(" -wss: Save kangaroos via the server\n");
@@ -164,6 +177,121 @@ static string serverIP = "";
 static string outputFile = "";
 static bool splitWorkFile = false;
 
+static bool isHexString(const string &value) {
+  if(value.empty()) {
+    return false;
+  }
+  for(char c : value) {
+    if(!isxdigit(static_cast<unsigned char>(c))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static string stripHexPrefix(const string &value) {
+  if(value.size() >= 2 && value[0] == '0' && (value[1] == 'x' || value[1] == 'X')) {
+    return value.substr(2);
+  }
+  return value;
+}
+
+static void setIntBase10(Int &target, const string &value) {
+  vector<char> buff(value.begin(), value.end());
+  buff.push_back('\0');
+  target.SetBase10(buff.data());
+}
+
+static void setIntBase16(Int &target, const string &value) {
+  vector<char> buff(value.begin(), value.end());
+  buff.push_back('\0');
+  target.SetBase16(buff.data());
+}
+
+static std::string toHex64(Int value) {
+  std::string hex = value.GetBase16();  // OK: value is non-const here
+  if (hex.size() > 64) {
+    std::printf("Range value exceeds 256-bit limit\n");
+    std::exit(-1);
+  }
+  if (hex.size() < 64) {
+    hex.insert(hex.begin(), static_cast<std::string::size_type>(64 - hex.size()), '0');
+  }
+  return hex;
+}
+
+class ScopedTempFile {
+public:
+  ScopedTempFile() : file(nullptr) {}
+  ~ScopedTempFile() {
+    cleanup();
+  }
+
+  void create() {
+    cleanup();
+#ifdef _WIN32
+    char tempPath[MAX_PATH];
+    if(GetTempPathA(MAX_PATH, tempPath) == 0) {
+      throw std::runtime_error("GetTempPathA failed");
+    }
+    char tempFile[MAX_PATH];
+    if(GetTempFileNameA(tempPath, "kang", 0, tempFile) == 0) {
+      throw std::runtime_error("GetTempFileNameA failed");
+    }
+    path.assign(tempFile);
+    file = fopen(path.c_str(), "w+");
+    if(!file) {
+      throw std::runtime_error("Unable to open temporary file");
+    }
+#else
+    const char *tmpdir = getenv("TMPDIR");
+    string base = tmpdir ? string(tmpdir) : string(P_tmpdir ? P_tmpdir : "/tmp");
+    if(base.empty()) {
+      base = "/tmp";
+    }
+    if(base.back() != '/') {
+      base.push_back('/');
+    }
+    string templ = base + "kangarooXXXXXX";
+    vector<char> buf(templ.begin(), templ.end());
+    buf.push_back('\0');
+    int fd = mkstemp(buf.data());
+    if(fd == -1) {
+      throw std::runtime_error("Unable to create temporary file");
+    }
+    path.assign(buf.data());
+    file = fdopen(fd, "w+");
+    if(!file) {
+      close(fd);
+      throw std::runtime_error("Unable to open temporary file stream");
+    }
+#endif
+  }
+
+  FILE *get() const {
+    return file;
+  }
+
+  const string &getPath() const {
+    return path;
+  }
+
+  void cleanup() {
+    if(file) {
+      fclose(file);
+      file = nullptr;
+    }
+    if(!path.empty()) {
+      std::remove(path.c_str());
+      path.clear();
+    }
+  }
+
+private:
+  FILE *file;
+  string path;
+};
+
 int main(int argc, char* argv[]) {
 
 #ifdef USE_SYMMETRY
@@ -182,6 +310,12 @@ int main(int argc, char* argv[]) {
 
   int a = 1;
   nbCPUThread = Timer::getCoreNumber();
+
+  string startDecArg;
+  string endDecArg;
+  string startHexArg;
+  string endHexArg;
+  string pubkeyArg;
 
   while (a < argc) {
 
@@ -298,6 +432,26 @@ int main(int argc, char* argv[]) {
     } else if(strcmp(argv[a],"-check") == 0) {
       checkFlag = true;
       a++;
+    } else if(strcmp(argv[a],"--start-dec") == 0) {
+      CHECKARG("--start-dec",1);
+      startDecArg = string(argv[a]);
+      a++;
+    } else if(strcmp(argv[a],"--end-dec") == 0) {
+      CHECKARG("--end-dec",1);
+      endDecArg = string(argv[a]);
+      a++;
+    } else if(strcmp(argv[a],"--start-hex") == 0) {
+      CHECKARG("--start-hex",1);
+      startHexArg = stripHexPrefix(string(argv[a]));
+      a++;
+    } else if(strcmp(argv[a],"--end-hex") == 0) {
+      CHECKARG("--end-hex",1);
+      endHexArg = stripHexPrefix(string(argv[a]));
+      a++;
+    } else if(strcmp(argv[a],"--pubkey") == 0) {
+      CHECKARG("--pubkey",1);
+      pubkeyArg = stripHexPrefix(string(argv[a]));
+      a++;
     } else if(a == argc - 1) {
       configFile = string(argv[a]);
       a++;
@@ -306,6 +460,82 @@ int main(int argc, char* argv[]) {
       exit(-1);
     }
 
+  }
+
+  bool hasDecRange = (!startDecArg.empty() || !endDecArg.empty());
+  bool hasHexRange = (!startHexArg.empty() || !endHexArg.empty());
+  bool hasRangeFlags = hasDecRange || hasHexRange;
+
+  if(hasDecRange && hasHexRange) {
+    printf("Specify either decimal or hex range flags, not both\n");
+    exit(-1);
+  }
+
+  if(hasDecRange && (startDecArg.empty() || endDecArg.empty())) {
+    printf("Both --start-dec and --end-dec must be provided\n");
+    exit(-1);
+  }
+
+  if(hasHexRange && (startHexArg.empty() || endHexArg.empty())) {
+    printf("Both --start-hex and --end-hex must be provided\n");
+    exit(-1);
+  }
+
+  if(hasRangeFlags && pubkeyArg.empty()) {
+    printf("--pubkey is required when range flags are used\n");
+    exit(-1);
+  }
+
+  if(!pubkeyArg.empty() && !isHexString(pubkeyArg)) {
+    printf("--pubkey must be hex encoded\n");
+    exit(-1);
+  }
+
+  string normalizedStartHex;
+  string normalizedEndHex;
+  string normalizedPubkey;
+  if(!pubkeyArg.empty()) {
+    normalizedPubkey = pubkeyArg;
+    std::transform(normalizedPubkey.begin(), normalizedPubkey.end(), normalizedPubkey.begin(), [](unsigned char c) {
+      return static_cast<char>(toupper(c));
+    });
+  }
+
+  if(hasRangeFlags) {
+    Int startInt;
+    Int endInt;
+
+    if(hasDecRange) {
+      for(char c : startDecArg) {
+        if(!isdigit(static_cast<unsigned char>(c))) {
+          printf("--start-dec must be a non-negative decimal\n");
+          exit(-1);
+        }
+      }
+      for(char c : endDecArg) {
+        if(!isdigit(static_cast<unsigned char>(c))) {
+          printf("--end-dec must be a non-negative decimal\n");
+          exit(-1);
+        }
+      }
+      setIntBase10(startInt, startDecArg);
+      setIntBase10(endInt, endDecArg);
+    } else {
+      if(!isHexString(startHexArg) || !isHexString(endHexArg)) {
+        printf("--start-hex and --end-hex must be hex encoded\n");
+        exit(-1);
+      }
+      setIntBase16(startInt, startHexArg);
+      setIntBase16(endInt, endHexArg);
+    }
+
+    if(startInt.IsGreater(&endInt)) {
+      printf("Start range must be less than or equal to end range\n");
+      exit(-1);
+    }
+
+    normalizedStartHex = toHex64(startInt);
+    normalizedEndHex = toHex64(endInt);
   }
 
   if(gridSize.size() == 0) {
@@ -320,8 +550,10 @@ int main(int argc, char* argv[]) {
 
   Kangaroo *v = new Kangaroo(secp,dp,gpuEnable,workFile,iWorkFile,savePeriod,saveKangaroo,saveKangarooByServer,
                              maxStep,wtimeout,port,ntimeout,serverIP,outputFile,splitWorkFile);
+  ScopedTempFile tempFile;
+
   if(checkFlag) {
-    v->Check(gpuId,gridSize);  
+    v->Check(gpuId,gridSize);
     exit(0);
   } else {
     if(checkWorkFile.length() > 0) {
@@ -336,15 +568,51 @@ int main(int argc, char* argv[]) {
     } else if(merge1.length()>0) {
       v->MergeWork(merge1,merge2,mergeDest);
       exit(0);
-    } if(iWorkFile.length()>0) {
-      if( !v->LoadWork(iWorkFile) )
+    }
+
+    if(hasRangeFlags) {
+      try {
+        tempFile.create();
+      } catch(const std::exception &ex) {
+        printf("Failed to create temporary configuration file: %s\n", ex.what());
         exit(-1);
+      }
+
+      FILE *fp = tempFile.get();
+      if(!fp) {
+        printf("Failed to open temporary configuration file\n");
+        exit(-1);
+      }
+
+      if(fprintf(fp, "%s\n%s\n%s\n", normalizedStartHex.c_str(), normalizedEndHex.c_str(), normalizedPubkey.c_str()) < 0) {
+        printf("Failed to write temporary configuration file\n");
+        exit(-1);
+      }
+      fflush(fp);
+
+      configFile = tempFile.getPath();
+    }
+
+    if(iWorkFile.length()>0) {
+      if( !v->LoadWork(iWorkFile) ) {
+        if(hasRangeFlags) {
+          tempFile.cleanup();
+        }
+        exit(-1);
+      }
     } else if(configFile.length()>0) {
-      if( !v->ParseConfigFile(configFile) )
+      bool parsed = v->ParseConfigFile(configFile);
+      if(hasRangeFlags) {
+        tempFile.cleanup();
+      }
+      if( !parsed )
         exit(-1);
     } else {
       if(serverIP.length()==0) {
         ::printf("No input file to process\n");
+        if(hasRangeFlags) {
+          tempFile.cleanup();
+        }
         exit(-1);
       }
     }
